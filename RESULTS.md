@@ -326,3 +326,158 @@ is why run 1's plan dropped that phase.
 - Everything in run 2's "next" list that is still open: the no-`grow` fast path,
   entity dispatch and real flexbox in the prototype, the degenerate deep/narrow
   scenes, and the persistently-mapped quad buffer.
+
+---
+
+# Runs 4-5 — fast path, verification, entity dispatch (2026-11-20)
+
+Steps (b) and (c) of the plan at the end of run 3. Step (a) — function-level
+attribution inside GPUI's 2.32 ms — is still open: it needs `perf_event_paranoid`
+relaxed or valgrind installed, both of which need root, so it was not done.
+
+What replaced it: GPUI's own **`changing share`** group, which varies the fraction
+of elements changed per frame. That answers the same question more directly.
+
+## GPUI cost vs amount changed (wide/seed-0, 1649 elements)
+
+| elements changed | instr/frame | allocs/frame | bytes/frame |
+|---|---|---|---|
+| **0%** (root notified, nothing changed) | 34.458 M | 8 454 | 4.746 M |
+| 1% | 35.631 M | 10 342 | 5.076 M |
+| 5% | 35.623 M | 10 346 | 5.076 M |
+| 25% | 35.715 M | 10 352 | 5.080 M |
+| **100%** | 36.299 M | 10 360 | 5.097 M |
+| 5% spread | 35.315 M | 10 124 | 4.924 M |
+| 25% spread | 35.517 M | 10 136 | 4.934 M |
+
+**0% to 100% moves instructions by 5.3%.** Allocations rise 22.5%, and nearly all
+of that is the 0%→1% step (8 454 → 10 342); 1% to 100% adds 18 allocations.
+Locality is irrelevant: spread and localized differ by under 1%.
+
+GPUI's frame cost is therefore independent of how much changed. Recolouring one
+element of 1649 costs within 2% of recolouring all of them. The marginal cost of
+a change is ~0; the fixed cost of *any* change is the whole tree. This is the
+view-granularity finding stated by Zed's own harness rather than inferred.
+
+## (b) The no-grow layout fast path
+
+Two changes to the incremental path:
+
+- Skip the grow-redistribution scan when no child uses `grow` along the parent's
+  main axis. One child's size then cannot change another's.
+- Reposition from the changed child onward rather than from the parent's content
+  edge, breaking as soon as a sibling lands where it already was.
+
+| | run 2 | run 4 |
+|---|---|---|
+| wide/1649 leaf_bounds | 9 984 | **6 048** (−39%) |
+| wide/1649 root_layout | 8 253 | **5 780** (−30%) |
+| wide/2048 leaf_bounds | 12 426 | **7 514** (−40%) |
+| mixed/256 leaf_bounds | 41 | 87 (+112%) |
+
+`mixed` got slower because **run 2's 41 ns was wrong** — see below.
+
+## Verification found two real bugs, and one measurement artefact
+
+`verifyLayout` snapshots what the incremental path produced, recomputes the whole
+layout, and compares every element's bounds and intrinsic size.
+
+1. **Wrong climb scope.** The climb set `top` to the first ancestor whose
+   intrinsic was unchanged, then repositioned *that element among its siblings*.
+   An element whose size did not change does not move — but its children still
+   need laying out, starting from the one on the path.
+2. **Descent gated on movement.** `drainReposition` skipped a subtree when none
+   of a parent's children moved. A child can land exactly where it was while a
+   descendant still needs repositioning; the alternating +1/−1 delta reproduces
+   this reliably. Fixed by stamping the chain of changed intrinsics and
+   descending along it regardless of movement.
+
+Bug 2 is why run 2's `mixed/256 leaf_bounds` read 41 ns: it was skipping work it
+owed. The correct figure is 87 ns. **A benchmark without verification would have
+reported that bug as a 2x speed-up.**
+
+3. **Self-inflicted measurement artefact.** Moving the position counter into the
+   hot loop made the faster version measurably slower — 1 649 memory increments
+   per frame instead of one. `leaf_bounds` read 11 129 ns until the counter was
+   accumulated in a local, then 8 000 ns for the same work.
+
+## (c) Entity dispatch and input regions
+
+Added so the `full_refresh` comparison is no longer against a toy:
+
+- **11% of elements are entity-backed.** Render goes through a function pointer
+  (two bodies, so the call cannot be devirtualised) after a slot-table lookup
+  with a generation check, the way `Entity<T>` resolves.
+- **19% register an input region** {rect, element, handler} during paint.
+
+Fidelity check against GPUI's wide/seed-0: measured 172/1649 entities (10.4%, target
+11%) and 303 regions (18.4%, target 19%).
+
+Cost: `full_refresh` 27 842 → **30 939 ns (+11%)** at wide/1649, and
+`sizeOf(Element)` 68 → 88 bytes.
+
+Deliberately **not** added: full flexbox (wrap, min/max-content, baseline). The
+subset is a design choice argued in run 1, not an omission — matching Taffy's
+feature set would be a different project. The remaining instruction gap below is
+therefore partly real design difference and partly missing features, and the
+distinction cannot be collapsed.
+
+## Final prototype numbers (wide/1649, after all of the above)
+
+ns, mean over 2000 frames. **Zero allocations on every incremental frame.**
+
+| scenario | mean ns | instr/frame | cycles/frame | cache miss/frame | IPC |
+|---|---|---|---|---|---|
+| full_refresh | 30 939 | 690 349 | 165 516 | 0.46 | 4.17 |
+| **unchanged** | **15** | **217** | 210 | 0.23 | 1.03 |
+| **leaf_style** | **16** | **295** | 219 | 0.24 | 1.35 |
+| leaf_bounds | 6 150 | 101 236 | 35 798 | 0.27 | 2.83 |
+
+At IPC 1.03 the `unchanged` figure is dominated by the measurement apparatus —
+the `clock_gettime` vdso call — not by work. The real cost of that frame in this
+design is "check a dirty set and return".
+
+## Head to head, same 1649 elements
+
+| scenario | GPUI | prototype | ratio |
+|---|---|---|---|
+| instructions, nothing changed | 34 458 000 | **217** | ~159 000x |
+| instructions, one element's style | ~35 631 000 | **295** | ~121 000x |
+| instructions, full refresh | 34 526 000 | 690 349 | **50x** |
+| allocations, nothing changed | 8 454 | **0** | — |
+| cache misses, nothing changed | 307 853 | **0.23** | — |
+
+The `full_refresh` ratio tightened from run 1's 65x to **50x** once entities and
+handler regions were included. The rest is subset flexbox, a 12-field style
+against GPUI's ~100, no scene layer/clip stack, no GPU submit, and no text.
+
+## Verdict after five runs
+
+The project has a measured technical justification, and it is narrow and specific:
+**GPUI pays its full frame cost for any change, however small.** Per-element dirty
+tracking makes the common frame cost essentially nothing.
+
+Everything else that looked like a reason did not survive measurement. Zig is not
+meaningfully faster per element. The arena wins allocation count and cache
+behaviour, which buys p99 jitter and memory, not mean frame time. GPUI is already
+fast enough that a full refresh of 1649 elements fits in 42% of a 120 fps budget.
+
+## Still open
+
+1. Where GPUI's 2.32 ms goes by function — needs root for perf or valgrind.
+2. A persistently-mapped quad buffer, to confirm a single-quad patch reaches the
+   GPU without a full re-upload. Without this, the `leaf_style` win stops at the
+   CPU boundary.
+3. Text. Untouched by all five runs, and run 1 put GPUI 2-5x ahead there.
+4. The degenerate `deep`/`narrow` scenes, whose bounds collapse to ~7 visible quads.
+5. Whether 50-100 us is the right floor for a real toolkit's fixed per-frame cost
+   (input, dirty scan, present).
+
+## Note on Zig pre-1.0
+
+Three breaking changes were hit while writing ~900 lines of benchmark against
+0.17: `std.time.Timer` removed, `std.posix.clock_gettime` gone, and
+`std.process.args` reworked (arguments and environment both became non-global in
+0.16). The scenario selector ended up as a comptime build option to avoid the
+argument API entirely. This is the churn risk from run 1's plan, observed rather
+than predicted.

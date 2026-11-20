@@ -16,6 +16,7 @@
 //! discipline GPUI's bench applies to its own counters.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 const NONE: u32 = std.math.maxInt(u32);
 
@@ -63,6 +64,11 @@ const Element = struct {
     intrinsic_h: f32 = 0,
     bounds: Rect = .{},
 
+    /// Set when this element is backed by an entity whose render must run.
+    entity: Handle = .{},
+    render: ?RenderFn = null,
+    has_handler: bool = false,
+
     /// Whether any child uses `grow` along THIS element's main axis. When none
     /// do, a child's size change cannot change any other child's size, so the
     /// grow-redistribution pass is pointless and siblings before the changed
@@ -82,6 +88,45 @@ const Quad = struct {
     visible: bool = false,
 };
 
+/// A retained entity: GPUI resolves `Entity<T>` through a slot table with a
+/// generation check before calling the view's `render`. Modelled here so the
+/// indirect call and the handle check are paid, not optimised away.
+const EntitySlot = struct { gen: u32 = 1, state: u32 = 0 };
+
+const Handle = struct { idx: u32 = NONE, gen: u32 = 0 };
+
+const RenderFn = *const fn (t: *Tree, el: u32, state: u32) void;
+
+/// A registered input region. GPUI rebuilds these every frame as part of paint;
+/// a retained design can patch only the ones whose bounds moved.
+const Region = struct {
+    rect: Rect = .{},
+    el: u32 = NONE,
+    handler: ?*const fn (u32) void = null,
+};
+
+fn onClickA(el: u32) void {
+    @import("std").mem.doNotOptimizeAway(el);
+}
+fn onClickB(el: u32) void {
+    @import("std").mem.doNotOptimizeAway(el);
+}
+
+/// Two render bodies so the call site cannot be devirtualised to one target.
+fn renderEntityA(t: *Tree, el: u32, state: u32) void {
+    const e = &t.els[el];
+    e.color = state *% 2654435761;
+    e.corner = @floatFromInt(state % 8);
+    t.ctr.entity += 1;
+}
+
+fn renderEntityB(t: *Tree, el: u32, state: u32) void {
+    const e = &t.els[el];
+    e.color = (state *% 40503) ^ 0x9e37;
+    e.pad = @floatFromInt(state % 4);
+    t.ctr.entity += 1;
+}
+
 const Topology = enum { wide, deep, mixed, narrow };
 
 // ---------------------------------------------------------------------- tree
@@ -91,13 +136,16 @@ const Counters = struct {
     intrinsic: u32 = 0,
     position: u32 = 0,
     paint: u32 = 0,
+    entity: u32 = 0,
+    region: u32 = 0,
 
     fn clear(self: *Counters) void {
         self.* = .{};
     }
 
     fn total(self: Counters) u32 {
-        return self.build + self.intrinsic + self.position + self.paint;
+        return self.build + self.intrinsic + self.position + self.paint +
+            self.entity + self.region;
     }
 };
 
@@ -114,6 +162,8 @@ const Tree = struct {
     /// A stamp avoids an O(n) clear each frame.
     path_stamp: []u32,
     snap_intr: []Rect, // scratch: intrinsic sizes, for the same verification
+    entities: []EntitySlot,
+    regions: []Region, // one slot per element, patched in place
     frame_no: u32 = 1,
 
     n: usize, // element count including root
@@ -135,6 +185,8 @@ const Tree = struct {
             .snapshot = try gpa.alloc(Rect, n),
             .path_stamp = try gpa.alloc(u32, n),
             .snap_intr = try gpa.alloc(Rect, n),
+            .entities = try gpa.alloc(EntitySlot, n),
+            .regions = try gpa.alloc(Region, n),
             .n = n,
             .topo = topo,
             .seed = seed,
@@ -150,6 +202,8 @@ const Tree = struct {
         gpa.free(self.snapshot);
         gpa.free(self.path_stamp);
         gpa.free(self.snap_intr);
+        gpa.free(self.entities);
+        gpa.free(self.regions);
     }
 
     // -------------------------------------------------------------- structure
@@ -193,6 +247,13 @@ const Tree = struct {
                 .corner = @floatFromInt(r.uintLessThan(u32, 8)),
                 .color = r.int(u32),
             };
+            // GPUI's wide/seed-0 tree is 11% entities, 19% handlers
+            if (r.uintLessThan(u32, 100) < 11) {
+                self.entities[i] = .{ .gen = 1, .state = r.int(u32) };
+                els[i].entity = .{ .idx = @intCast(i), .gen = 1 };
+                els[i].render = if (i % 2 == 0) &renderEntityA else &renderEntityB;
+            }
+            els[i].has_handler = r.uintLessThan(u32, 100) < 19;
             els[i].next_sibling = els[parent].first_child;
             els[parent].first_child = @intCast(i);
             els[parent].child_count += 1;
@@ -482,6 +543,14 @@ const Tree = struct {
             .visible = e.bounds.w > 0 and e.bounds.h > 0,
         };
         self.ctr.paint += 1;
+        if (e.has_handler) {
+            self.regions[idx] = .{
+                .rect = e.bounds,
+                .el = idx,
+                .handler = if (idx % 2 == 0) &onClickA else &onClickB,
+            };
+            self.ctr.region += 1;
+        }
     }
 
     fn paintAll(self: *Tree) void {
@@ -490,9 +559,34 @@ const Tree = struct {
 
     // -------------------------------------------------------------- scenarios
 
+    /// Resolves the handle then calls render through a function pointer, the
+    /// way a view-backed element is rebuilt.
+    fn renderEntities(self: *Tree) void {
+        for (self.pre[0..self.n]) |idx| {
+            const e = self.els[idx];
+            const rf = e.render orelse continue;
+            const h = e.entity;
+            if (h.idx == NONE) continue;
+            const slot = self.entities[h.idx];
+            if (slot.gen != h.gen) continue; // stale handle
+            rf(self, idx, slot.state);
+        }
+    }
+
+    fn renderEntity(self: *Tree, idx: u32) void {
+        const e = self.els[idx];
+        const rf = e.render orelse return;
+        const h = e.entity;
+        if (h.idx == NONE) return;
+        const slot = self.entities[h.idx];
+        if (slot.gen != h.gen) return;
+        rf(self, idx, slot.state);
+    }
+
     fn fullRefresh(self: *Tree) void {
         self.build();
         self.computeOrders();
+        self.renderEntities();
         self.intrinsicAll();
         self.positionAll();
         self.paintAll();
@@ -506,7 +600,13 @@ const Tree = struct {
 
     /// A leaf's colour changes. Cannot affect layout, so it is one quad patch.
     fn leafStyle(self: *Tree, leaf: u32) void {
-        self.els[leaf].color ^= 0x00ff_00ff;
+        if (self.els[leaf].render != null) {
+            // state change on the backing entity, then re-render just that element
+            self.entities[self.els[leaf].entity.idx].state +%= 1;
+            self.renderEntity(leaf);
+        } else {
+            self.els[leaf].color ^= 0x00ff_00ff;
+        }
         self.paintElement(leaf);
     }
 
@@ -658,6 +758,8 @@ fn checkCounters(s: Scenario, c: Counters, n: usize) void {
             if (c.paint < n) @panic("full refresh must paint every element");
             if (c.intrinsic < n) @panic("full refresh must size every element");
             if (c.build < n - 1) @panic("full refresh must build every element");
+            if (c.entity == 0) @panic("full refresh must render entities");
+            if (c.region == 0) @panic("full refresh must register input regions");
         },
         .unchanged => {
             if (c.total() != 0) @panic("unchanged must do no work");
@@ -678,10 +780,54 @@ fn checkCounters(s: Scenario, c: Counters, n: usize) void {
 
 const Case = struct { topo: Topology, count: usize };
 
+/// Silent single-scenario runner so perf counters divide by iteration count.
+/// Usage: incremental perf-<scenario> [iters]
+fn perfMain(gpa: std.mem.Allocator, which: Scenario, iters: usize) !void {
+    var t = try Tree.alloc(gpa, .wide, 1649, 0x5eed);
+    defer t.free(gpa);
+    t.ctr.clear();
+    t.fullRefresh();
+
+    const leaf: u32 = blk: {
+        var k: u32 = 1;
+        while (k < t.n) : (k += 1) {
+            const e = t.els[k];
+            if (e.first_child != NONE) continue;
+            const fixed_on_main = switch (t.els[e.parent].axis) {
+                .row => e.w_mode == .fixed,
+                .col => e.h_mode == .fixed,
+            };
+            if (fixed_on_main and k > t.n / 2) break :blk k;
+        }
+        @panic("no leaf");
+    };
+
+    var acc: u64 = 0;
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        const sm = runScenario(&t, which, leaf, i);
+        acc +%= sm.ns +% sm.ctr.total();
+    }
+    std.mem.doNotOptimizeAway(&acc);
+}
+
 pub fn main() !void {
     var dbg = std.heap.DebugAllocator(.{}).init;
     defer _ = dbg.deinit();
     const gpa = dbg.allocator();
+
+    const perf_scenario: ?Scenario = comptime blk: {
+        const name = build_options.scenario;
+        if (std.mem.eql(u8, name, "full")) break :blk .full_refresh;
+        if (std.mem.eql(u8, name, "unchanged")) break :blk .unchanged;
+        if (std.mem.eql(u8, name, "leaf-style")) break :blk .leaf_style;
+        if (std.mem.eql(u8, name, "leaf-bounds")) break :blk .leaf_bounds;
+        break :blk null;
+    };
+    if (perf_scenario) |w| {
+        try perfMain(gpa, w, 20000);
+        return;
+    }
 
     const cases = [_]Case{
         .{ .topo = .wide, .count = 1649 }, // matches GPUI wide/seed-0
@@ -695,10 +841,12 @@ pub fn main() !void {
     const warmup = 200;
     const iters = 2000;
 
-    std.debug.print("{s:<7} {s:>6} {s:<14} {s:>10} {s:>10} {s:>8} {s:>8} {s:>8} {s:>8}\n", .{
-        "topo", "count", "scenario", "mean ns", "best ns", "build", "intrins", "pos", "paint",
+    std.debug.print("{s:<7} {s:>6} {s:<14} {s:>10} {s:>10} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7}\n", .{
+        "topo",  "count", "scenario", "mean ns", "best ns",
+        "build", "intr",  "pos",      "paint",   "entity",
+        "region",
     });
-    std.debug.print("----------------------------------------------------------------------------------------\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------------------------\n", .{});
 
     for (cases) |case| {
         var t = try Tree.alloc(gpa, case.topo, case.count, 0x5eed);
@@ -760,10 +908,13 @@ pub fn main() !void {
                 last = sm.ctr;
             }
 
-            std.debug.print("{s:<7} {d:>6} {s:<14} {d:>10} {d:>10} {d:>8} {d:>8} {d:>8} {d:>8}\n", .{
-                @tagName(case.topo), case.count,     @tagName(s), sum / iters,
-                best,                last.build,     last.intrinsic,
-                last.position,       last.paint,
+            std.debug.print("{s:<7} {d:>6} {s:<14} {d:>10} {d:>10} {d:>7} {d:>7} {d:>7} {d:>7} {d:>7} {d:>7}\n", .{
+                @tagName(case.topo), case.count,
+                @tagName(s),         sum / iters,
+                best,                last.build,
+                last.intrinsic,      last.position,
+                last.paint,          last.entity,
+                last.region,
             });
         }
         std.debug.print("\n", .{});
