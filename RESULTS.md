@@ -557,3 +557,118 @@ across roughly 1 100 lines of benchmark against 0.17:
 SheenBidi and SDL3 through C interop, and all of that now goes through
 `addTranslateC` build steps rather than inline `@cImport`. That shapes the build
 graph, so it belongs in the Phase 0 spike rather than being discovered later.
+
+---
+
+# Run 7 — GPUI's text baseline (2026-11-20)
+
+Text was untouched by runs 1-6, and run 1 guessed GPUI would be "2-5x ahead,
+closing slowly". That was never measured. This measures it.
+
+GPUI's own `layout_line` benchmark, from `gpui-pre-wgpu` 0.3.11. It lays out one
+long display line of ASCII code text in three configurations: a single font, a
+font with a fallback chain, and a corpus containing a bidi paragraph separator
+plus Hebrew to force the per-paragraph path.
+
+**Font substitution.** The published crate's `include_bytes!` paths point outside
+the crate (`../../../assets/fonts/...`), so the upstream Lilex and IBM Plex fonts
+are unavailable. System **DejaVu Sans Mono** (primary) and **DejaVu Sans**
+(fallback) are substituted — the same shape of configuration. DejaVu has broad
+coverage and large GPOS/GSUB tables; Lilex is a coding font with ligatures. The
+direction of the resulting bias is unknown, so **absolute numbers here are not
+comparable to upstream runs of this benchmark**, only to each other and to a Zig
+counterpart measured on the same two fonts.
+
+Corpus: **7 928 characters, 7 928 glyphs, one run, one line.** (The bench's own
+comment says "~4 000 chars"; it is 7 928.)
+
+## Measured
+
+criterion, 100 samples each:
+
+| case | time | vs no_fallback |
+|---|---|---|
+| `no_fallback` | **1.4241 ms** [1.4126, 1.4389] | — |
+| `with_fallback_ascii` | 1.5074 ms [1.5012, 1.5151] | +5.9% |
+| `mixed_direction_paragraphs` | 1.5193 ms [1.5151, 1.5240] | +6.7% |
+
+`perf`, 2 000 fixed iterations of the same calls:
+
+| case | chars | instr/call | cycles/call | ns/call (cycles / 5.55 GHz) | IPC |
+|---|---|---|---|---|---|
+| no_fallback | 7 928 | 22 470 960 | 8 171 286 | 1 472 304 | 2.75 |
+| with_fallback | 7 928 | 24 517 620 | 8 392 184 | 1 512 105 | 2.92 |
+| mixed_direction | 7 931 | 23 353 727 | 7 915 248 | 1 426 171 | 2.95 |
+
+The two methods agree within 3% (1.472 ms derived vs 1.4241 ms measured), which
+is the first cross-validated timing in this whole exercise.
+
+## Per character, and at realistic sizes
+
+**2 834 instructions, 1 031 cycles, 186 ns per character** — uncached.
+
+| | instructions | time |
+|---|---|---|
+| one 80-char code line | 0.23 M | 14.9 us |
+| 50 lines x 80 chars (one screen, fully uncached) | 11.34 M | **743 us** |
+| for comparison: one 1649-element frame rebuild | 34.5 M | 2 320 us |
+
+743 us is **8.9% of a 120 fps budget** for laying out an entire screen of text
+from scratch. In practice GPUI caches line layouts, so a steady-state frame pays
+far less; this is the cost of a cache miss.
+
+## The finding that matters
+
+GPUI on Linux shapes with **`rustybuzz` 0.20.1** via cosmic-text 0.19 — a Rust
+reimplementation of HarfBuzz — not C HarfBuzz. The rest of the stack is `swash`
+0.2.6 for rasterisation, `ttf-parser` 0.25, `unicode-bidi` 0.3, `fontdb` 0.23.
+
+rustybuzz is generally slower than C HarfBuzz. A Zig stack binding C HarfBuzz
+directly is therefore **not obviously behind on Linux**, which is the opposite of
+what run 1 assumed.
+
+### Correcting run 1
+
+Run 1 put GPUI "2-5x ahead on text, closing slowly" and called text the factor
+that "can dominate everything else". That was an unmeasured guess and the data
+does not support it as stated:
+
+- Uncached layout is 186 ns/char; a full uncached screen is 8.9% of a 120 fps budget.
+- The shaping engine is rustybuzz, not a hand-tuned C path.
+- On **macOS** GPUI uses CoreText, which is a different and much more
+  heavily optimised story. The Linux result does not transfer there.
+
+Text is still the largest remaining unknown, but it is not the blocker run 1
+described.
+
+## Secondary observations
+
+- A fallback chain costs **+9% instructions** (22.47 → 24.52 M) even though the
+  content is pure ASCII and fallback never fires. Configuring a chain is not free.
+- The bidi/mixed-direction path is **not expensive**: 23.35 M instructions
+  against 22.47 M, and fewer cycles than `no_fallback`. GPUI's per-paragraph
+  path is cheap, so bidi support need not be deferred on performance grounds.
+- IPC 2.75-2.95: compute-bound, not stall-bound. 1 031 cycles per ASCII
+  character is a lot of actual work.
+
+## Caveats
+
+- Font substitution, as above. Bias direction unknown.
+- The uncached path only. Real frames hit GPUI's line-layout cache.
+- A 7 928-character single line is far longer than any real display line; the
+  per-character figures are the transferable numbers, not the per-call ones.
+- Linux/cosmic-text only. macOS CoreText is unmeasured.
+- Allocation per call is unmeasured here; a 7 928-glyph `Vec<ShapedRun>` is
+  roughly 250 KB per call, which is likely a visible share of the cost.
+
+## Next
+
+1. **Test the C HarfBuzz hypothesis.** A Zig text spike — C HarfBuzz + FreeType
+   through `addTranslateC`, same two DejaVu fonts, same corpus — measuring
+   instructions per character against 2 834. This is now the highest-value
+   remaining measurement, because run 1's text assumption was wrong and the
+   answer changes whether text is a reason to build or a reason not to.
+2. Measure allocations per `layout_line` call, to see how much of the 2 834 is
+   shaping versus building the glyph vector.
+3. Still open from earlier runs: function-level attribution inside GPUI's 2.32 ms
+   (needs root), and the degenerate `deep`/`narrow` scenes.

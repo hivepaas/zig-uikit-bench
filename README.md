@@ -35,9 +35,12 @@ zig/                 arena-based element tree + layout + paint prototype
   src/quadbuf.zig      quad-buffer writes into Vulkan-mapped GPU memory
   src/vk.h             translation unit for the translate-c build step
   build.zig
-gpui/                baseline harness driving Zed's own benchmark
-  setup.sh             builds the bench project from crates.io
+gpui/                baseline harness driving Zed's own benchmarks
+  setup.sh             builds the element-tree bench project from crates.io
   run.sh               the invocations used in RESULTS.md
+  text/                GPUI's layout_line text bench, patched to system fonts
+    setup.sh, run.sh
+    layout_line.patched.rs, text_single.rs
 RESULTS.md           measured numbers, machine, and what may be concluded
 ```
 
@@ -123,7 +126,15 @@ GPU memory: rewriting **all** 1649 quads costs 0.58–1.22 us, against GPUI's
 2.32 ms of CPU per unchanged frame — 0.05%. **Persistently-mapped patching is a
 micro-optimisation, not a requirement**, and run 2's caveat is withdrawn.
 
-Still open: memoisation does not help wide trees for size changes, because
-flexbox must rescan every sibling; and text is untouched by all six runs.
+Run 7 measured text, which runs 1-6 had left alone. GPUI's uncached line layout
+costs **186 ns and 2 834 instructions per character**; a full uncached screen of
+50x80 chars is 743 us, or 8.9% of a 120 fps budget. Run 1's guess that GPUI was
+"2-5x ahead on text" does not survive: on Linux it shapes with **rustybuzz**, a
+Rust port of HarfBuzz, not C HarfBuzz — so a Zig stack binding C HarfBuzz is not
+obviously behind. (macOS uses CoreText and is a different story, unmeasured.)
 
-See [RESULTS.md](RESULTS.md), runs 2, 3 and 6.
+Still open: memoisation does not help wide trees for size changes, because
+flexbox must rescan every sibling; and whether C HarfBuzz actually beats
+rustybuzz here.
+
+See [RESULTS.md](RESULTS.md), runs 2, 3, 6 and 7.
