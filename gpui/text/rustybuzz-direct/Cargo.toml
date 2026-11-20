@@ -1,0 +1,12 @@
+[package]
+name = "rustybuzz-direct"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+rustybuzz = "0.20.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

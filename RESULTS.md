@@ -672,3 +672,99 @@ described.
    shaping versus building the glyph vector.
 3. Still open from earlier runs: function-level attribution inside GPUI's 2.32 ms
    (needs root), and the degenerate `deep`/`narrow` scenes.
+
+---
+
+# Run 8 — C HarfBuzz vs rustybuzz, verified (2026-11-20)
+
+Run 7's finding was that GPUI shapes with rustybuzz on Linux, not C HarfBuzz, so
+a Zig stack binding C HarfBuzz might not be behind at all. This tests that.
+
+**Correctness first.** Three dumps of glyph id, cluster and x position over the
+same 7 928-character corpus and the same font, compared pairwise:
+
+| pair | glyph ids | clusters | max x deviation |
+|---|---|---|---|
+| GPUI `layout_line` vs rustybuzz-direct | identical | identical | 0.0000 px |
+| GPUI `layout_line` vs C HarfBuzz | identical | identical | 0.0038 px |
+| rustybuzz-direct vs C HarfBuzz | identical | identical | 0.0038 px |
+
+0 of 7 928 glyph ids differ. The 0.0038 px residual over a 66 820 px line is f32
+accumulation noise.
+
+A bug found on the way: `hb_font_set_scale(font, size * 64, size * 64)` quantises
+advances to 1/64 px, which over this line drifted **60 px** away from rustybuzz.
+Setting the scale to the design units and converting in f32 — what rustybuzz does
+— removes it. A toolkit that wants subpixel-accurate positions must not take the
+26.6 shortcut.
+
+## Measured, all three on the same corpus and font
+
+| | instr/char | cycles/char | ns/char | IPC |
+|---|---|---|---|---|
+| GPUI `layout_line` (cosmic-text 0.19 + rustybuzz 0.20.1) | 2 834 | 1 031 | 186 | 2.75 |
+| **rustybuzz direct** (engine only) | **960** | 286 | **51.5** | 3.36 |
+| **C HarfBuzz 12.3.2** (engine only) | **293** | 55.9 | **9.8** | 5.24 |
+
+"Engine only" means the same hardcoded direction (LTR), script (Latin) and
+language (en), a reused shaping buffer, and a pre-allocated output array on both
+sides. That makes the two engine rows a fair comparison with each other.
+
+## Decomposition
+
+**Engine to engine:** C HarfBuzz is **3.3x fewer instructions and 5.3x faster**
+than rustybuzz for identical output. The IPC progression — 5.24, 3.36, 2.75 —
+says C HarfBuzz is very well optimised, rustybuzz's port is reasonable, and
+cosmic-text's layer costs again on top.
+
+**But the engine is only 34% of the path.** 2 834 − 960 = **1 874 instructions
+per character, 66% of GPUI's `layout_line`, is not shaping**: bidi paragraph
+analysis, per-character fallback coverage checks, run segmentation, and
+allocating `Vec<ShapedRun>`/`Vec<ShapedGlyph>` (~250 KB per call at this length).
+
+So swapping the engine alone takes 2 834 → 1 874 + 293 = 2 167 instructions per
+character: **about 1.3x overall**, not 9.7x. The 19x time ratio between GPUI's
+full path and a bare C HarfBuzz call is **not an achievable win** — two thirds of
+it is work a real toolkit also has to do.
+
+### Where the remaining opportunity actually is
+
+1 874 instructions per character for bidi, fallback and allocation is high, and
+that is the part a different design could attack — a retained glyph buffer
+removes the per-call allocation, and a toolkit that knows a run is single-script
+ASCII can skip most of the analysis. **None of that is measured.** It is the next
+question, not a result.
+
+### Correcting runs 1 and 7, in order
+
+- **Run 1** guessed GPUI was "2-5x ahead on text, closing slowly" and called text
+  the factor that could "dominate everything else". Wrong: on Linux the engine it
+  uses is 3.3x more expensive than the C one a Zig stack would bind.
+- **Run 7** reported the rustybuzz finding but left the implication open. The
+  implication is narrower than it looked: the engine swap is worth ~1.3x on the
+  whole path, because the engine is a third of it.
+
+Text is therefore neither the blocker of run 1 nor the open goal of run 7. It is
+a modest win with an unmeasured larger one behind it.
+
+## Caveats
+
+- Font substitution from run 7 still applies (DejaVu for Lilex/IBM Plex).
+- Linux only. macOS GPUI uses CoreText, unmeasured, and likely a different answer.
+- ASCII only. Complex scripts would exercise GSUB/GPOS much harder and the ratio
+  could move either way.
+- The Zig path hardcodes direction, script and language and never resolves
+  fallback, so it is not a usable text system — it is the shaping core of one.
+- Rasterisation is not measured at all. `layout_line` does not rasterise either,
+  so the comparison is consistent, but a text stack needs a glyph atlas on top.
+
+## Note on Zig pre-1.0, continued
+
+Breaking change six, hit in this run: **`std.fs.cwd()` no longer exists.** The
+filesystem moved to `std.Io.Dir`, and every call takes an `Io` value — the "I/O
+as an interface" rework. Reading a font file now means constructing
+`std.Io.Threaded` and threading `io` through. `std.ArrayList` also lost
+`.writer()`, so the dump is built with `std.fmt.bufPrint` into a plain buffer.
+
+Running total: six breaking changes across roughly 1 500 lines of benchmark
+written against 0.17.

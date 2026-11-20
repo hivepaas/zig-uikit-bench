@@ -71,6 +71,33 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(quadbuf);
 
+    // C HarfBuzz shaping, against the rustybuzz reference from run 7.
+    const shape_mode = b.option([]const u8, "shape-mode", "report|verify|perf") orelse "report";
+    const corpus = b.option([]const u8, "corpus", "path to the corpus file") orelse
+        "../gpui/text/ref/corpus_no_fallback.txt";
+    const shape_opts = b.addOptions();
+    shape_opts.addOption([]const u8, "mode", shape_mode);
+    shape_opts.addOption([]const u8, "corpus", corpus);
+
+    const hb_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/hb.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hb_translate.addIncludePath(.{ .cwd_relative = "/usr/include/harfbuzz" });
+
+    const shape_mod = b.createModule(.{
+        .root_source_file = b.path("src/shape.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shape_mod.addImport("hb", hb_translate.createModule());
+    shape_mod.addOptions("build_options", shape_opts);
+    shape_mod.link_libc = true;
+    shape_mod.linkSystemLibrary("harfbuzz", .{});
+    const shape = b.addExecutable(.{ .name = "shape", .root_module = shape_mod });
+    b.installArtifact(shape);
+
     const run = b.addRunArtifact(tree_bench);
     b.step("run", "Run the element-tree benchmark table").dependOn(&run.step);
 }
