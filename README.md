@@ -31,6 +31,9 @@ not a language bet — and it is the next thing to measure.
 zig/                 arena-based element tree + layout + paint prototype
   src/tree_bench.zig   all topologies and element counts, prints a table
   src/single.zig       one config (wide/2048) so perf can attribute counters
+  src/incremental.zig  element-level memoisation across GPUI's change classes
+  src/quadbuf.zig      quad-buffer writes into Vulkan-mapped GPU memory
+  src/vk.h             translation unit for the translate-c build step
   build.zig
 gpui/                baseline harness driving Zed's own benchmark
   setup.sh             builds the bench project from crates.io
@@ -115,8 +118,12 @@ lavapipe (+60% instructions, only +11% wall). So the avoidable CPU cost is
 ~2.32 ms per frame, not the ~0.9 ms run 2 guessed. That is 28% of a 120 fps
 budget spent on a frame where nothing changed.
 
-Still open: whether the renderer can patch its quad buffer in place instead of
-re-uploading, and the fact that memoisation does not help wide trees for size
-changes because flexbox must rescan every sibling.
+Run 6 settled the quad-buffer question by measuring writes into Vulkan-mapped
+GPU memory: rewriting **all** 1649 quads costs 0.58–1.22 us, against GPUI's
+2.32 ms of CPU per unchanged frame — 0.05%. **Persistently-mapped patching is a
+micro-optimisation, not a requirement**, and run 2's caveat is withdrawn.
 
-See [RESULTS.md](RESULTS.md), runs 2 and 3.
+Still open: memoisation does not help wide trees for size changes, because
+flexbox must rescan every sibling; and text is untouched by all six runs.
+
+See [RESULTS.md](RESULTS.md), runs 2, 3 and 6.

@@ -48,6 +48,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(incremental);
 
+    // Is a persistently-mapped quad buffer necessary? Writes into real
+    // GPU-visible memory via Vulkan. Needs the Vulkan loader and headers.
+    // @cImport was removed in Zig 0.17, so the C header is translated as a
+    // build step and imported as a module.
+    const vk_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/vk.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const quadbuf_mod = b.createModule(.{
+        .root_source_file = b.path("src/quadbuf.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quadbuf_mod.addImport("vk", vk_translate.createModule());
+    quadbuf_mod.link_libc = true;
+    quadbuf_mod.linkSystemLibrary("vulkan", .{});
+    const quadbuf = b.addExecutable(.{
+        .name = "quadbuf",
+        .root_module = quadbuf_mod,
+    });
+    b.installArtifact(quadbuf);
+
     const run = b.addRunArtifact(tree_bench);
     b.step("run", "Run the element-tree benchmark table").dependOn(&run.step);
 }

@@ -481,3 +481,79 @@ Three breaking changes were hit while writing ~900 lines of benchmark against
 0.16). The scenario selector ended up as a comptime build option to avoid the
 argument API entirely. This is the churn risk from run 1's plan, observed rather
 than predicted.
+
+---
+
+# Run 6 — is a persistently-mapped quad buffer necessary? (2026-11-20)
+
+Run 2 claimed that without one, the `leaf_style` win "stops at the CPU boundary",
+because the renderer would re-upload the whole quad buffer each frame. That was
+asserted without measuring. **It is wrong.**
+
+`zig/src/quadbuf.zig` writes into real GPU-visible memory mapped through Vulkan
+(no swapchain, no pipeline, no command buffers — purely the cost of writing to
+host-visible device memory).
+
+Device: **AMD Ryzen 9 9950X integrated GPU (RADV RAPHAEL_MENDOCINO)**.
+
+Memory types found: `DEVICE_LOCAL|HOST_VISIBLE` (type 3, heap 1, 21 675 MB),
+`HOST_VISIBLE|HOST_CACHED` (type 5, heap 0), `HOST_VISIBLE|HOST_COHERENT` (type 2).
+
+## Measured (best of 200)
+
+| target | quads | KB | full rewrite | 1 quad | half | GB/s |
+|---|---|---|---|---|---|---|
+| DEVICE_LOCAL\|HOST_VISIBLE (BAR) | 1649 | 45 | **1 160 ns** | 2 ns | 630 ns | 39.80 |
+| DEVICE_LOCAL\|HOST_VISIBLE (BAR) | 2048 | 56 | 1 500 ns | 3 ns | 760 ns | 38.23 |
+| DEVICE_LOCAL\|HOST_VISIBLE (BAR) | 10 000 | 273 | 8 580 ns | 2 ns | 4 390 ns | 32.63 |
+| DEVICE_LOCAL\|HOST_VISIBLE (BAR) | 50 000 | 1 367 | 45 871 ns | 3 ns | 23 870 ns | 30.52 |
+| HOST_VISIBLE\|HOST_CACHED | 1649 | 45 | **580 ns** | 1 ns | 300 ns | 79.61 |
+| HOST_VISIBLE\|HOST_CACHED | 50 000 | 1 367 | 16 450 ns | 1 ns | 7 820 ns | 85.11 |
+| HOST_VISIBLE\|HOST_COHERENT | 1649 | 45 | 1 220 ns | 2 ns | 690 ns | 37.85 |
+| plain heap (reference) | 1649 | 45 | 580 ns | 1 ns | 300 ns | 79.61 |
+| plain heap (reference) | 50 000 | 1 367 | 16 510 ns | 1 ns | 7 850 ns | 84.80 |
+
+## Conclusion
+
+Rewriting the **entire** quad buffer for GPUI's 1649-element tree costs
+**0.58–1.22 us**, against the 2 320 000 ns of CPU that GPUI spends on an
+unchanged frame. That is **0.05%**.
+
+**Persistently-mapped patching is a micro-optimisation, not a Phase 1
+architectural requirement.** A renderer that rewrites every quad every frame
+loses about a microsecond. Run 2's caveat is withdrawn, and one item comes off
+the Phase 1 requirements list.
+
+Secondary observations:
+
+- `HOST_CACHED` takes CPU writes at 2x the rate of BAR memory (79.6 vs 39.8 GB/s)
+  and matches plain heap exactly. The GPU then reads it across the bus, which
+  this run does not measure, so it is not a free win — just a real trade.
+- A single-quad patch is 1–3 ns, i.e. one cache line. Nothing surprising.
+- Throughput falls off above the cache: 39.8 → 30.5 GB/s from 45 KB to 1.37 MB.
+
+## Caveats, and the one that matters
+
+**This is an integrated GPU with unified memory.** A discrete card writes BAR
+memory across PCIe, where uncached write-combining typically achieves 2–8 GB/s
+rather than 40. The same 45 KB would then cost roughly 6–20 us instead of 1.2 us
+— still microseconds, still negligible against 2.32 ms, but with roughly 10x less
+margin. The conclusion holds; the headroom does not.
+
+Also unmeasured: barriers, cache maintenance for non-coherent memory, and command
+buffer submission. `HOST_COHERENT` avoids explicit `vkFlushMappedMemoryRanges`;
+non-coherent memory would not.
+
+## Note on Zig pre-1.0, continued
+
+Two more breaking changes while writing this file, bringing the total to **five**
+across roughly 1 100 lines of benchmark against 0.17:
+
+4. **`@cImport` was removed.** C headers are now translated as a build step via
+   `b.addTranslateC`, imported as a module.
+5. **`std.ArrayList`'s initialisation changed** again; replaced with fixed storage.
+
+(4) is not a detail for this project. A Zig UI toolkit needs harfbuzz, freetype,
+SheenBidi and SDL3 through C interop, and all of that now goes through
+`addTranslateC` build steps rather than inline `@cImport`. That shapes the build
+graph, so it belongs in the Phase 0 spike rather than being discovered later.
