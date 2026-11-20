@@ -62,6 +62,12 @@ const Element = struct {
     intrinsic_w: f32 = 0,
     intrinsic_h: f32 = 0,
     bounds: Rect = .{},
+
+    /// Whether any child uses `grow` along THIS element's main axis. When none
+    /// do, a child's size change cannot change any other child's size, so the
+    /// grow-redistribution pass is pointless and siblings before the changed
+    /// one cannot move. Maintained at build time and on structural change.
+    any_grow_main: bool = false,
 };
 
 /// One quad slot per element rather than a packed array, so patching a single
@@ -101,12 +107,22 @@ const Tree = struct {
     post: []u32, // bottom-up traversal (reverse of pre)
     quads: []Quad, // one slot per element
     stack: []u32, // scratch for iterative walks
+    snapshot: []Rect, // scratch for verifying incremental layout against full
+    /// Frame stamp marking the chain of elements whose intrinsic size changed.
+    /// Descent must follow this chain even where bounds did not move: a child
+    /// can land exactly where it was while a descendant still needs laying out.
+    /// A stamp avoids an O(n) clear each frame.
+    path_stamp: []u32,
+    snap_intr: []Rect, // scratch: intrinsic sizes, for the same verification
+    frame_no: u32 = 1,
 
     n: usize, // element count including root
     topo: Topology,
     seed: u64,
 
     ctr: Counters = .{},
+    dbg_from: u32 = NONE,
+    dbg_child: u32 = NONE,
 
     fn alloc(gpa: std.mem.Allocator, topo: Topology, count: usize, seed: u64) !Tree {
         const n = count + 1;
@@ -116,6 +132,9 @@ const Tree = struct {
             .post = try gpa.alloc(u32, n),
             .quads = try gpa.alloc(Quad, n),
             .stack = try gpa.alloc(u32, n),
+            .snapshot = try gpa.alloc(Rect, n),
+            .path_stamp = try gpa.alloc(u32, n),
+            .snap_intr = try gpa.alloc(Rect, n),
             .n = n,
             .topo = topo,
             .seed = seed,
@@ -128,12 +147,16 @@ const Tree = struct {
         gpa.free(self.post);
         gpa.free(self.quads);
         gpa.free(self.stack);
+        gpa.free(self.snapshot);
+        gpa.free(self.path_stamp);
+        gpa.free(self.snap_intr);
     }
 
     // -------------------------------------------------------------- structure
 
     /// Same topology semantics as gpui::randomized_element_tree.
     fn build(self: *Tree) void {
+        @memset(self.path_stamp, 0);
         var prng = std.Random.DefaultPrng.init(self.seed);
         const r = prng.random();
         const els = self.els;
@@ -175,6 +198,23 @@ const Tree = struct {
             els[parent].child_count += 1;
             last_deep = @intCast(i);
             self.ctr.build += 1;
+        }
+
+        for (els[0..self.n], 0..) |*e, idx| {
+            _ = idx;
+            var any = false;
+            var c = e.first_child;
+            while (c != NONE) : (c = els[c].next_sibling) {
+                const grows = switch (e.axis) {
+                    .row => els[c].w_mode == .grow,
+                    .col => els[c].h_mode == .grow,
+                };
+                if (grows) {
+                    any = true;
+                    break;
+                }
+            }
+            e.any_grow_main = any;
         }
     }
 
@@ -261,36 +301,42 @@ const Tree = struct {
         const inner_w = @max(0, e.bounds.w - e.pad * 2);
         const inner_h = @max(0, e.bounds.h - e.pad * 2);
 
-        var used: f32 = 0;
-        var grow_n: f32 = 0;
+        var per_grow: f32 = 0;
         var kids: u32 = 0;
-        var c = e.first_child;
-        while (c != NONE) : (c = self.els[c].next_sibling) {
-            const ch = &self.els[c];
-            const grows = switch (e.axis) {
-                .row => ch.w_mode == .grow,
-                .col => ch.h_mode == .grow,
+        var work: u32 = 0;
+        if (e.any_grow_main) {
+            // grow children exist, so every sibling's main size depends on the
+            // total claimed by the others: the full scan is unavoidable
+            var used: f32 = 0;
+            var grow_n: f32 = 0;
+            var c = e.first_child;
+            while (c != NONE) : (c = self.els[c].next_sibling) {
+                const ch = &self.els[c];
+                const grows = switch (e.axis) {
+                    .row => ch.w_mode == .grow,
+                    .col => ch.h_mode == .grow,
+                };
+                if (grows) grow_n += 1 else used += switch (e.axis) {
+                    .row => ch.intrinsic_w,
+                    .col => ch.intrinsic_h,
+                };
+                kids += 1;
+            }
+            if (kids > 1) used += e.gap * @as(f32, @floatFromInt(kids - 1));
+            const avail = switch (e.axis) {
+                .row => inner_w,
+                .col => inner_h,
             };
-            if (grows) grow_n += 1 else used += switch (e.axis) {
-                .row => ch.intrinsic_w,
-                .col => ch.intrinsic_h,
-            };
-            kids += 1;
+            per_grow = if (grow_n > 0) @max(0, avail - used) / grow_n else 0;
+            work += kids; // the grow-redistribution scan
         }
-        if (kids > 1) used += e.gap * @as(f32, @floatFromInt(kids - 1));
-
-        const avail = switch (e.axis) {
-            .row => inner_w,
-            .col => inner_h,
-        };
-        const per_grow = if (grow_n > 0) @max(0, avail - used) / grow_n else 0;
 
         var any_moved = false;
         var cursor: f32 = switch (e.axis) {
             .row => inner_x,
             .col => inner_y,
         };
-        c = e.first_child;
+        var c = e.first_child;
         while (c != NONE) : (c = self.els[c].next_sibling) {
             const ch = &self.els[c];
             var cw = switch (ch.w_mode) {
@@ -318,10 +364,9 @@ const Tree = struct {
                 .row => cw + e.gap,
                 .col => chh + e.gap,
             };
+            work += 1;
         }
-        // counts child slots examined: flex must scan every sibling to
-        // redistribute grow space, so this is the real work unit, not the call
-        self.ctr.position += kids * 2;
+        self.ctr.position += work;
         return any_moved;
     }
 
@@ -334,19 +379,91 @@ const Tree = struct {
     /// actually moved. This is what makes a bounds change cost O(affected)
     /// rather than O(tree).
     fn repositionSubtree(self: *Tree, root_idx: u32) void {
+        self.stack[0] = root_idx;
+        self.drainReposition(1);
+    }
+
+    /// Repositions `start_child` and every later sibling, leaving earlier
+    /// siblings untouched. Only valid when the parent has no `grow` child on its
+    /// main axis: then one child's size cannot change another's, so the cursor
+    /// can start at `start_child`'s existing position instead of the parent's
+    /// content edge. Breaks as soon as a child lands exactly where it already
+    /// was, because every later sibling then lands where it already was too.
+    fn repositionFrom(self: *Tree, parent: u32, start_child: u32) void {
+        const e = &self.els[parent];
+        if (e.any_grow_main) {
+            self.repositionSubtree(parent);
+            return;
+        }
+
+        const inner_x = e.bounds.x + e.pad;
+        const inner_y = e.bounds.y + e.pad;
+        const inner_w = @max(0, e.bounds.w - e.pad * 2);
+        const inner_h = @max(0, e.bounds.h - e.pad * 2);
+
         var sp: usize = 0;
-        self.stack[sp] = root_idx;
-        sp += 1;
+        var work: u32 = 0;
+        var cursor: f32 = switch (e.axis) {
+            .row => self.els[start_child].bounds.x,
+            .col => self.els[start_child].bounds.y,
+        };
+
+        var c = start_child;
+        while (c != NONE) : (c = self.els[c].next_sibling) {
+            const ch = &self.els[c];
+            var cw = switch (ch.w_mode) {
+                .fixed => ch.fixed_w,
+                .fit => ch.intrinsic_w,
+                .grow => inner_w, // cross axis here, since main has no grow
+            };
+            var chh = switch (ch.h_mode) {
+                .fixed => ch.fixed_h,
+                .fit => ch.intrinsic_h,
+                .grow => inner_h,
+            };
+            cw = @min(cw, inner_w);
+            chh = @min(chh, inner_h);
+
+            const nb: Rect = switch (e.axis) {
+                .row => .{ .x = cursor, .y = inner_y, .w = cw, .h = chh },
+                .col => .{ .x = inner_x, .y = cursor, .w = cw, .h = chh },
+            };
+            work += 1;
+            // The start child's own bounds may be unchanged while its children's
+            // sizes are not, so it always gets descended into. For later
+            // siblings, landing where they already were means every sibling
+            // after them does too.
+            const is_start = c == start_child;
+            if (!is_start and nb.eq(ch.bounds)) break;
+            ch.bounds = nb;
+            self.paintElement(c);
+            if (ch.first_child != NONE) {
+                self.stack[sp] = c;
+                sp += 1;
+            }
+            cursor += switch (e.axis) {
+                .row => cw + e.gap,
+                .col => chh + e.gap,
+            };
+        }
+        self.ctr.position += work;
+        self.drainReposition(sp);
+    }
+
+    fn drainReposition(self: *Tree, seeded: usize) void {
+        var sp = seeded;
         while (sp > 0) {
             sp -= 1;
             const idx = self.stack[sp];
             const moved = self.positionChildren(idx);
             self.paintElement(idx);
-            if (!moved) continue;
             var c = self.els[idx].first_child;
             while (c != NONE) : (c = self.els[c].next_sibling) {
-                self.paintElement(c);
-                if (self.els[c].first_child != NONE) {
+                if (moved) self.paintElement(c);
+                if (self.els[c].first_child == NONE) continue;
+                // descend when the child moved, or when it carries a changed
+                // intrinsic further down even though it did not move itself
+                if (moved or self.path_stamp[c] == self.frame_no) {
                     self.stack[sp] = c;
                     sp += 1;
                 }
@@ -404,23 +521,45 @@ const Tree = struct {
         if (e.h_mode == .fixed) e.intrinsic_h = e.fixed_h;
         self.ctr.intrinsic += 1;
 
-        var top = leaf;
+        // Climb while each ancestor's own size keeps changing. The first
+        // ancestor whose intrinsic is unchanged does not move and neither do
+        // its siblings -- but its children must be laid out again, starting
+        // from the one on the path. `child_on_path` tracks that child.
+        var child_on_path = leaf;
         var node = self.els[leaf].parent;
         while (node != NONE) {
             const changed = self.recomputeIntrinsic(node);
-            top = node;
             if (!changed) break;
+            child_on_path = node;
             node = self.els[node].parent;
         }
+        const from: u32 = if (node == NONE) 0 else node;
+        self.dbg_from = from;
+        self.dbg_child = child_on_path;
 
-        const from = if (self.els[top].parent == NONE) top else self.els[top].parent;
-        self.repositionSubtree(from);
+        // Mark leaf..from so descent can follow the chain of changed intrinsics
+        // even through elements whose own bounds happen not to move.
+        self.frame_no +%= 1;
+        if (self.frame_no == 0) {
+            @memset(self.path_stamp, 0);
+            self.frame_no = 1;
+        }
+        var m: u32 = leaf;
+        while (m != NONE) : (m = self.els[m].parent) {
+            self.path_stamp[m] = self.frame_no;
+            if (m == from) break;
+        }
+
+        self.repositionFrom(from, child_on_path);
     }
 
     /// The root's own layout changes, so every position is recomputed, but the
     /// tree structure and all intrinsic sizes below it are reused.
     fn rootLayout(self: *Tree, delta: f32) void {
         self.els[0].fixed_w += delta;
+        // root is fixed on both axes, so its intrinsic must track fixed_w or the
+        // cached value goes stale -- harmless for layout, but inconsistent state
+        self.els[0].intrinsic_w = self.els[0].fixed_w;
         self.els[0].bounds.w = self.els[0].fixed_w;
         self.repositionSubtree(0);
     }
@@ -429,6 +568,66 @@ const Tree = struct {
 // ----------------------------------------------------------------- harness
 
 const Scenario = enum { full_refresh, unchanged, leaf_style, leaf_bounds, root_layout };
+
+/// A fast path that is wrong is worthless. Snapshots the bounds the incremental
+/// path produced, recomputes the whole layout from scratch, and compares.
+var verify_leaf: u32 = NONE;
+
+fn verifyLayout(t: *Tree, label: []const u8) void {
+    for (t.els[0..t.n], 0..) |e, i| {
+        t.snapshot[i] = e.bounds;
+        t.snap_intr[i] = .{ .w = e.intrinsic_w, .h = e.intrinsic_h };
+    }
+    t.intrinsicAll();
+    // report stale intrinsics before layout masks them
+    var stale: u32 = 0;
+    for (t.els[0..t.n], 0..) |e, i| {
+        if (e.intrinsic_w != t.snap_intr[i].w or e.intrinsic_h != t.snap_intr[i].h) {
+            if (stale < 8) std.debug.print(
+                "  STALE INTRINSIC el {d}: incremental {d}x{d} != full {d}x{d} (parent {d}, h {s})\n",
+                .{ i, t.snap_intr[i].w, t.snap_intr[i].h, e.intrinsic_w, e.intrinsic_h, e.parent, @tagName(e.h_mode) },
+            );
+            stale += 1;
+        }
+    }
+    if (stale > 0) std.debug.print("  stale intrinsics: {d}; measured leaf = {d}\n", .{ stale, verify_leaf });
+    t.positionAll();
+    for (t.els[0..t.n], 0..) |e, i| {
+        if (!e.bounds.eq(t.snapshot[i])) {
+            std.debug.print(
+                "VERIFY FAIL {s}: element {d} incremental {any} != full {any}\n",
+                .{ label, i, t.snapshot[i], e.bounds },
+            );
+            // dump the chain from the bad element up to the root
+            std.debug.print(
+                "  leaf={d} climb stopped at from={d} child_on_path={d}; from.grow_main={any}\n",
+                .{ verify_leaf, t.dbg_from, t.dbg_child, if (t.dbg_from == NONE) false else t.els[t.dbg_from].any_grow_main },
+            );
+            {
+                // is the bad element a descendant of the climb entry point?
+                var a: u32 = @intCast(i);
+                var depth: u32 = 0;
+                while (a != NONE and a != t.dbg_from) : (a = t.els[a].parent) depth += 1;
+                std.debug.print("  el {d} is {s} from (depth {d}); leaf chain:", .{
+                    i, if (a == t.dbg_from) "under" else "NOT under", depth,
+                });
+                var l: u32 = verify_leaf;
+                while (l != NONE) : (l = t.els[l].parent) std.debug.print(" {d}", .{l});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("  chain from {d} up:\n", .{i});
+            var dn: u32 = @intCast(i);
+            while (dn != NONE) : (dn = t.els[dn].parent) {
+                const d = t.els[dn];
+                std.debug.print(
+                    "    el {d:>4} parent {d:>4} axis {s} w {s} h {s} kids {d:>3} pad {d} gap {d} grow_main {any} intr {d}x{d}\n",
+                    .{ dn, d.parent, @tagName(d.axis), @tagName(d.w_mode), @tagName(d.h_mode), d.child_count, d.pad, d.gap, d.any_grow_main, d.intrinsic_w, d.intrinsic_h },
+                );
+            }
+            @panic("incremental layout diverged from full layout");
+        }
+    }
+}
 
 const Sample = struct {
     ns: u64,
@@ -542,8 +741,12 @@ pub fn main() !void {
             t.ctr.clear();
             t.fullRefresh();
 
+            verify_leaf = leaf;
             var w: usize = 0;
-            while (w < warmup) : (w += 1) _ = runScenario(&t, s, leaf, w);
+            while (w < warmup) : (w += 1) {
+                _ = runScenario(&t, s, leaf, w);
+                if (w < 4) verifyLayout(&t, @tagName(s));
+            }
 
             var sum: u64 = 0;
             var best: u64 = std.math.maxInt(u64);
@@ -566,6 +769,7 @@ pub fn main() !void {
         std.debug.print("\n", .{});
     }
 
+    std.debug.print("sizeOf(Element)={d} sizeOf(Quad)={d}\n", .{ @sizeOf(Element), @sizeOf(Quad) });
     std.debug.print("counters are from the last measured frame; work is asserted every frame\n", .{});
     std.debug.print("tree is retained, so incremental frames allocate nothing\n", .{});
 }
