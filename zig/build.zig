@@ -26,6 +26,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(single);
 
+
+    // Element-level incremental rebuild across GPUI's change classes.
+    const incremental = b.addExecutable(.{
+        .name = "incremental",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/incremental.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(incremental);
+
     const run = b.addRunArtifact(tree_bench);
     b.step("run", "Run the element-tree benchmark table").dependOn(&run.step);
 }

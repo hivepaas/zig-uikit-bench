@@ -100,10 +100,18 @@ GPUI is invalid until these are closed:
 Allocation counts and cache-miss counts are the exceptions: those follow from
 memory layout, not from feature count, so they survive the gap.
 
-## Open question
+## Open question — answered in run 2
 
-Prototype element-level memoisation and re-measure `unchanged`. If it drops to
-near zero while GPUI stays at full-refresh cost, there is a real technical
-reason to build the toolkit. If it does not, the remaining reasons are Zig
-itself, build speed, binary size and control — all legitimate, none of them
-performance.
+Element-level memoisation was prototyped (`zig/src/incremental.zig`).
+`unchanged` and `leaf_style` drop to 15 ns and zero allocations, against GPUI's
+3.9 ms and ~8 450 allocations at the same 1649 elements. So there is a real
+technical reason to build the toolkit, and it is **reactive granularity**, not
+per-element speed.
+
+Two caveats decide whether that converts into a user-visible win, and neither is
+measured yet: how much of GPUI's 3.9 ms is CPU a real toolkit would actually
+skip (GPU present is 3.02 ms of it), and whether the renderer can patch its quad
+buffer in place instead of re-uploading. Also found: memoisation does not help
+wide trees for size changes, because flexbox must rescan every sibling.
+
+See [RESULTS.md](RESULTS.md), run 2.
