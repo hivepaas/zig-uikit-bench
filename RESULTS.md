@@ -239,3 +239,90 @@ avoid, and whether the renderer can patch its quad buffer in place.
 4. Fix the degenerate `deep`/`narrow` scenes (clamp padding) so their numbers mean something.
 5. Prototype a persistently-mapped quad buffer and confirm a single-quad patch
    reaches the GPU without a full re-upload.
+
+---
+
+# Run 3 — separating CPU from GPU (2026-11-20)
+
+Run 2 left one thing blocking any quotable number: how much of GPUI's frame is
+CPU a real toolkit could skip, versus GPU submit it would still pay.
+
+`perf record` is unavailable here — Ubuntu 26.04 confines perf_event sampling
+(`perf stat` counting works, sampling returns "Access to performance monitoring
+and observability operations is limited" even at `perf_event_paranoid=2`). So the
+split is derived from counters plus a measured clock, and cross-checked with a
+driver swap.
+
+## Measured clock on core 2
+
+| source | cycles | elapsed | GHz |
+|---|---|---|---|
+| pure-CPU spin loop | 3 041 345 639 | 544.63 ms | 5.58 |
+| `zig-out/bin/single` | 3 385 338 657 | 610.68 ms | 5.54 |
+
+Core 2 sustains **~5.55 GHz** on CPU-bound work.
+
+## `unchanged`, wide/seed-0 (1649 elements), by driver
+
+| | amdgpu | lavapipe (software Vulkan) |
+|---|---|---|
+| instructions/frame | 34.513 M | 55.095 M (+60%) |
+| cycles/frame | 12.856 M | 21.472 M |
+| wall/frame | 3.121 ms | 3.452 ms (**+11%**) |
+| window dirty-to-draw | 2.895 ms | 3.132 ms |
+| window draw | 2.893 ms | 3.128 ms |
+| foreground executor work | 0.990 ms | 1.064 ms |
+| IPC | 2.684 | 2.566 |
+
+## The split
+
+12.856 M cycles at 5.55 GHz = **2.32 ms executing**, against 3.121 ms wall:
+
+| | ms | share |
+|---|---|---|
+| CPU executing | 2.32 | **74%** |
+| blocked (GPU submit, present, syscalls) | 0.81 | 26% |
+
+An earlier run reported `foreground share of instructions: 1.000`, so all 34.5 M
+instructions are on the benchmark thread. There is no background thread doing
+meaningful work to confound this.
+
+The lavapipe swap confirms the shape: replacing a real GPU with a CPU rasteriser
+adds **+60% instructions but only +11% wall**, because the GPU path was already
+idle-waiting and lavapipe fills that gap rather than extending the frame.
+
+### Correcting run 2
+
+Run 2 claimed "`window draw` is 3.02 of 3.91 ms, so the CPU share is only
+~0.9 ms." That was wrong. `window draw` is predominantly **CPU scene building**,
+not GPU submit. The avoidable CPU cost is about 2.5x larger than stated.
+
+## The quotable comparison
+
+GPUI, `unchanged`, 1649 elements: **~2.32 ms of foreground CPU, 34.5 M
+instructions, 8 454 allocations** — all of it rebuilding an element tree that did
+not change. That is **28% of a 120 fps budget spent on a frame where nothing
+happened.**
+
+Per-element memoisation (run 2): **15 ns, 0 allocations.**
+
+Allowing a real toolkit still owes input processing, the dirty scan and present —
+call it 50-100 us — the saving is **~2.2-2.3 ms of CPU per common frame, roughly
+23-46x less**.
+
+## Side finding: software Vulkan is a viable fallback
+
+lavapipe costs +11% wall on this UI workload. That supports taking the software
+fallback for free from lavapipe/WARP rather than writing a CPU rasteriser, which
+is why run 1's plan dropped that phase.
+
+## What is still unmeasured
+
+- Where the 2.32 ms goes inside GPUI (render / Taffy / paint / allocator). Needs
+  sampling, so it needs `perf_event_paranoid` relaxed, or a build with
+  instrumentation, or GPUI's `HeadlessAppContext` + `PlatformHeadlessRenderer`
+  driven directly.
+- Whether 50-100 us is the right floor for a real toolkit's fixed per-frame cost.
+- Everything in run 2's "next" list that is still open: the no-`grow` fast path,
+  entity dispatch and real flexbox in the prototype, the degenerate deep/narrow
+  scenes, and the persistently-mapped quad buffer.

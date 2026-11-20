@@ -108,10 +108,15 @@ Element-level memoisation was prototyped (`zig/src/incremental.zig`).
 technical reason to build the toolkit, and it is **reactive granularity**, not
 per-element speed.
 
-Two caveats decide whether that converts into a user-visible win, and neither is
-measured yet: how much of GPUI's 3.9 ms is CPU a real toolkit would actually
-skip (GPU present is 3.02 ms of it), and whether the renderer can patch its quad
-buffer in place instead of re-uploading. Also found: memoisation does not help
-wide trees for size changes, because flexbox must rescan every sibling.
+Run 3 scoped that properly. Of GPUI's 3.121 ms `unchanged` frame, **74% (2.32 ms)
+is the CPU executing** and 26% is blocked on GPU submit and present — derived
+from 12.856 M cycles at a measured 5.55 GHz, and cross-checked by swapping in
+lavapipe (+60% instructions, only +11% wall). So the avoidable CPU cost is
+~2.32 ms per frame, not the ~0.9 ms run 2 guessed. That is 28% of a 120 fps
+budget spent on a frame where nothing changed.
 
-See [RESULTS.md](RESULTS.md), run 2.
+Still open: whether the renderer can patch its quad buffer in place instead of
+re-uploading, and the fact that memoisation does not help wide trees for size
+changes because flexbox must rescan every sibling.
+
+See [RESULTS.md](RESULTS.md), runs 2 and 3.
