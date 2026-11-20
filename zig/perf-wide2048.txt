@@ -1,0 +1,16 @@
+# started on Fri Nov 20 15:55:07 2026
+
+
+ Performance counter stats for 'taskset -c 2 ./single':
+
+    13,188,366,591      instructions:u                                                        
+     3,385,338,657      cycles:u                                                              
+            72,629      cache-misses:u                                                        
+        13,326,355      branch-misses:u                                                       
+
+       0.610675208 seconds time elapsed
+
+       0.604982000 seconds user
+       0.003004000 seconds sys
+
+

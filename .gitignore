@@ -1,0 +1,5 @@
+work/
+target/
+zig-out/
+.zig-cache/
+perf.data*
