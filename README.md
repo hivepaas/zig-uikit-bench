@@ -44,6 +44,7 @@ zig/                 arena-based element tree + layout + paint prototype
   src/tree_bench.zig   all topologies and element counts, prints a table
   src/single.zig       one config (wide/2048) so perf can attribute counters
   src/incremental.zig  element-level memoisation across GPUI's change classes
+  src/incremental_flex.zig  the same, under real flexbox (run 9)
   src/quadbuf.zig      quad-buffer writes into Vulkan-mapped GPU memory
   src/vk.h             translation unit for the translate-c build step
   build.zig
@@ -145,8 +146,22 @@ costs **186 ns and 2 834 instructions per character**; a full uncached screen of
 Rust port of HarfBuzz, not C HarfBuzz — so a Zig stack binding C HarfBuzz is not
 obviously behind. (macOS uses CoreText and is a different story, unmeasured.)
 
-Still open: memoisation does not help wide trees for size changes, because
-flexbox must rescan every sibling; and whether C HarfBuzz actually beats
-rustybuzz here.
+Run 9 closed the biggest hole in all of the above: the layout model runs 2-5
+used was not flexbox, so none of the ratios were safe. `incremental_flex.zig`
+adds flex-shrink (CSS defaults it to 1, which couples every sibling), the CSS
+9.7 min/max freeze loop, wrap, justify-content and baseline alignment.
 
-See [RESULTS.md](RESULTS.md), runs 2, 3, 6 and 7.
+The premise survives, and the reason matters: **`unchanged` and `leaf_style` are
+bit-identical across layout models** — 15 ns, 245 instructions, zero
+allocations — because a frame that changes nothing does no layout work, however
+complicated the layout model is. What degrades is size-change propagation:
+2.35x slower on wide trees, where the prefix-scan fast path dies completely
+because an overflowing line makes every sibling's size depend on every other's.
+At 20.65 us that is 0.25% of a 120 fps budget, and the fast path still holds
+100% on realistic branching.
+
+Run 9 also found a real bug in the climb logic that is **latent in
+`incremental.zig`**, reachable only once baselines let a change propagate to the
+root. Runs 2-8 are unaffected and left as they are.
+
+See [RESULTS.md](RESULTS.md), runs 2, 3, 6, 7 and 9.

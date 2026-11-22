@@ -48,6 +48,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(incremental);
 
+    // Run 9: the same change classes under REAL flexbox -- shrink, min/max
+    // freeze loop, wrap, justify-content, baseline alignment. Separate file so
+    // runs 2-8 stay reproducible against the original model.
+    const flex_profile = b.option([]const u8, "flex-profile", "legacy|css-default|css-wrap") orelse "css-default";
+    const flex_opts = b.addOptions();
+    flex_opts.addOption([]const u8, "scenario", perf);
+    flex_opts.addOption([]const u8, "profile", flex_profile);
+
+    const inc_flex_mod = b.createModule(.{
+        .root_source_file = b.path("src/incremental_flex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inc_flex_mod.addOptions("build_options", flex_opts);
+    const inc_flex = b.addExecutable(.{
+        .name = "incremental_flex",
+        .root_module = inc_flex_mod,
+    });
+    b.installArtifact(inc_flex);
+
     // Is a persistently-mapped quad buffer necessary? Writes into real
     // GPU-visible memory via Vulkan. Needs the Vulkan loader and headers.
     // @cImport was removed in Zig 0.17, so the C header is translated as a

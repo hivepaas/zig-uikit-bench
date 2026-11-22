@@ -768,3 +768,165 @@ as an interface" rework. Reading a font file now means constructing
 
 Running total: six breaking changes across roughly 1 500 lines of benchmark
 written against 0.17.
+
+# Run 9 — does element-level memoisation survive real flexbox? (2026-11-22)
+
+Runs 2-5 measured per-element dirty tracking against a deliberately small layout
+model: three size modes, one padding scalar, no shrink, no min/max, no wrap, no
+alignment. The 23-46x CPU figure rests on it, and RESULTS.md has said since run 2
+that the figure is invalid until real flexbox is in.
+
+`zig/src/incremental_flex.zig` adds the five mechanisms that each break the
+assumption that a child's change is local:
+
+1. **flex-shrink.** CSS defaults to `flex: 0 1 auto` — every item shrinks. Once a
+   line overflows, one child growing redistributes size across all its siblings.
+   `any_grow_main` from run 4 cannot see this.
+2. **min/max clamping.** CSS 9.7 resolves flexible lengths with a freeze loop:
+   clamping one item frees space that must be redistributed among the rest, so
+   cost is passes x items.
+3. **flex-wrap.** A size change can move an item to another line, moving every
+   later item.
+4. **justify-content** other than `flex-start`. With `space-between` or `center`
+   every child's position depends on the line's total main size, so **earlier**
+   siblings move too — run 4's early-break is invalid.
+5. **baseline alignment.** Cross positions depend on the maximum baseline across
+   the line.
+
+Three profiles: `legacy` reproduces the run 2-5 model, `css_default` turns on
+shrink/clamps/alignment with a realistic mix, `css_wrap` adds wrap.
+`incremental.zig` is untouched, so runs 2-8 stay reproducible.
+
+## Measured — wide/1649 (GPUI's own topology: one root, 1649 children)
+
+| scenario | legacy | css_default | css_wrap |
+| --- | --- | --- | --- |
+| `unchanged` | 15 ns | **15 ns** | **15 ns** |
+| `leaf_style` | 15 ns | **16 ns** | **16 ns** |
+| `leaf_bounds` | 8 784 ns (fast 100%) | **20 650 ns (fast 0%)** | 19 942 ns (fast 0%) |
+| `full_refresh` | 45 566 ns | 48 717 ns | 49 561 ns |
+
+Instructions per frame, `css_default`, via `perf stat` over 20 000 iterations:
+
+| scenario | instructions | cycles | cache misses |
+| --- | --- | --- | --- |
+| `unchanged` | **245** | 229 | 0.26 |
+| `leaf_style` | 281 | 228 | 0.24 |
+| `leaf_bounds` | 496 599 | 111 703 | 0.41 |
+| `full_refresh` | 1 215 102 | 275 945 | 9.80 |
+
+## Measured — mixed/256 (realistic branching, 2-3 children per node)
+
+| scenario | legacy | css_default | css_wrap |
+| --- | --- | --- | --- |
+| `leaf_bounds` | 56 ns (fast 100%) | **298 ns (fast 100%)** | 1 627 ns (fast 0%) |
+
+## The finding
+
+**The premise survives, and the reason is worth being precise about: it was never
+a claim about layout cost.**
+
+`unchanged` and `leaf_style` are **identical across all three profiles** — 15 ns
+and 245 instructions, zero allocations, 0.26 cache misses. An unchanged frame
+does no layout work, so how complicated the layout model is cannot affect it.
+The comparison against GPUI's unchanged frame — 2.32 ms of CPU, 34 458 000
+instructions, 8 454 allocations, 307 853 cache misses — does not move at all.
+
+That is the whole architectural bet, and real flexbox does not touch it.
+
+## What did degrade, and by how much
+
+**Size-change propagation, by 2.35x on wide trees, and the prefix-scan fast path
+dies completely there** (100% -> 0% of repositions).
+
+The cause is mechanism 1. The `wide` root holds 1649 children in a 1080 px
+column — it overflows by roughly 30x. With `flex-shrink: 1` the line is always
+shrinking, so every sibling's resolved size depends on every other's, and
+repositioning from a middle child is simply invalid. `leaf_bounds` degenerates
+into a full relayout of the container: 3 298 position visits and 1 439 freeze-loop
+visits, against 824 and 0 under `legacy`.
+
+Two things keep this from being fatal:
+
+- **20.65 us is 0.25% of a 120 fps frame budget.** The degradation is real and
+  does not matter in absolute terms.
+- **The fast path survives realistic branching.** `mixed/256` holds 100% under
+  `css_default`. It dies specifically where a container overflows by an order of
+  magnitude, which is already broken UI.
+
+`full_refresh` cost only +7% (45 566 -> 48 717 ns). Real flexbox is not expensive
+to run; it is expensive to *memoise*.
+
+## A design requirement this run produced
+
+Overflow has to be detected in O(1) or the fast path is dead everywhere, not just
+on overflowing containers — testing it the obvious way means scanning every
+sibling, which is the work being avoided. `incremental_flex.zig` keeps `sum_main`
+(children's hypothetical outer main sizes plus gaps) per container, updated as
+intrinsics are recomputed on the climb. Without that cache, `flex-shrink: 1`
+alone would force the slow path on every single size change.
+
+This is a requirement on the real toolkit, not a benchmark trick.
+
+## Verification earned its keep again
+
+**One real bug.** `leafBounds` collapsed the climb loop's two exits:
+
+```zig
+const from: u32 = if (node == NONE) 0 else node;   // wrong
+```
+
+`break` means an ancestor's own size did not change, so only its children from
+the path child onward need repositioning. `node == NONE` means the change
+propagated out of the tree entirely, and `child_on_path` is the root itself —
+feeding that to `repositionFrom` lays the root out as its own child and adds its
+own padding to its own origin. It put the root at `x = 8` instead of `x = 0`, and
+`verifyLayout` caught it on the fourth warm-up frame of `deep/256`.
+
+This bug is **latent in `incremental.zig` too.** It only became reachable here
+because tracking `baseline` lets a change propagate all the way to the root,
+which the run 2-5 model could not express. Runs 2-8 are unaffected — their
+`verifyLayout` passed on all five cases — but the defect is real in that file and
+is left in place deliberately so those runs stay reproducible.
+
+**One wrong assumption of mine, caught by a counter assertion rather than by a
+bug.** `checkCounters` asserted `flexloop > 0` on every full refresh. Under
+`legacy` nothing has a flex factor, so an overflowing line resolves no flexible
+lengths and the counter is legitimately 0. The assertion was wrong, not the code.
+It is now profile-aware. Worth recording because this is the failure mode the
+discipline is *supposed* to have: a wrong expectation surfacing immediately
+instead of becoming a silent assumption.
+
+## Caveats
+
+- **Wrap's cost is a lower bound.** A wrapping container needs a non-`fit` cross
+  size in this model, because a correct `fit` cross size for a wrap container
+  depends on the available main size and needs a second pass. Real engines run
+  that pass. The omitted work would make memoisation harder, not easier.
+- `css_wrap` / `wide` / `leaf_bounds` reports `paint: 1`: the measured delta is
+  absorbed by a clamp, so nothing moves — yet the full container relayout
+  (3 298 + 1 448 visits) is still paid to discover that. That cell measures the
+  cost of *finding out* nothing changed, not the cost of propagation. It is a
+  genuine flexbox property and a genuine measurement, but not of what the other
+  cells measure.
+- Still absent, and still enough to invalidate any ratio against GPUI's full
+  refresh: the ~100-field style struct, style refinement, the scene layer and
+  clip stack, hit-test region trees, a11y nodes, and all GPU work.
+- `flex-basis` is modelled as fixed-or-content, not as a third independent
+  length. Percentage bases, `auto` margins and `align-self` overrides are absent.
+- The realistic-mix proportions (70% `justify: start`, 40% `align: center`, 25%
+  with minimums) are my estimates of common CSS, not data from a corpus of real
+  UIs. The `legacy` -> `css_default` direction of the result is robust; the exact
+  2.35x is not.
+
+## Verdict
+
+Spike A set out to find whether the headline claim survives real flexbox. It
+does, unchanged, because it is a claim about frames that do no layout. The
+secondary claim — that size changes stay local — survives in realistic trees and
+fails in overflowing ones, at a cost (20 us) far below anything a user could
+perceive.
+
+The premise holds. Proceed to spike B, which is the one that can actually kill
+the project: IME and accessibility are load-bearing for the self-drawn design,
+and neither has been attempted in Zig.
