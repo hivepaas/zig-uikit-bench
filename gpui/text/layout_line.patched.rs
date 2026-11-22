@@ -3,7 +3,7 @@ use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
 use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
-// Patched for uiwing-bench: the published crate's `include_bytes!` paths point
+// Patched for zig-uikit-bench: the published crate's `include_bytes!` paths point
 // outside the crate (../../../assets/), so the upstream fonts are unavailable.
 // System DejaVu is substituted: a monospace primary and a sans fallback, the
 // same shape of configuration. Absolute numbers are therefore NOT comparable to

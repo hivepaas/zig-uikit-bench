@@ -15,7 +15,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("report");
     let corpus_path = args.get(2).map(|s| s.as_str())
-        .unwrap_or("/Dev/dev/uiwing-bench/gpui/text/ref/corpus_no_fallback.txt");
+        .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../ref/corpus_no_fallback.txt"));
     let iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
 
     let font_data = std::fs::read(FONT).expect("font");

@@ -1,10 +1,22 @@
-# uiwing-bench
+# zig-uikit-bench
 
 Reproducible measurements comparing GPUI's element-tree frame cost against a
 Zig arena-based prototype, to decide whether a new Zig UI toolkit is worth
 building — before building it.
 
 **Short answer from the first run: not for frame time.** See [RESULTS.md](RESULTS.md).
+
+These are the measurements behind [zig-uikit](https://github.com/hivepaas/zig-uikit).
+Eight runs; most of the original hypotheses did not survive them, and the ones
+that failed are written up here alongside the ones that held. The single
+premise that did survive is **reactive granularity** — see the run index in
+[RESULTS.md](RESULTS.md), which states per run what may and may not be
+concluded from it.
+
+Nothing here is a benchmark of GPUI against a finished toolkit. The Zig side is
+a prototype missing most of what a real toolkit does; [what the Zig prototype
+does NOT do](#what-the-zig-prototype-does-not-do) lists the gaps, and the
+headline ratios are invalid until they are closed.
 
 ## Why this exists
 
