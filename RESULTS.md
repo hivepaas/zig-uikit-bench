@@ -930,3 +930,63 @@ perceive.
 The premise holds. Proceed to spike B, which is the one that can actually kill
 the project: IME and accessibility are load-bearing for the self-drawn design,
 and neither has been attempted in Zig.
+
+# Correction to run 9 — the fast path was taken where it was invalid (2026-11-24)
+
+Porting `zig/src/incremental_flex.zig` into the toolkit
+([zig-uikit](https://github.com/hivepaas/zig-uikit)) added a **randomised**
+equivalence test: build random trees, make random style changes, demand that
+the incremental result match a full recompute exactly. It failed on its first
+run, in a `deep` topology, with 37 of 67 elements off by three pixels on the
+cross axis.
+
+The cause is in `repositionFrom`:
+
+```zig
+.row => .{ .x = cursor, .y = inner_y, .w = main_sz, .h = cross_sz },
+```
+
+It writes the container's content edge unconditionally and **ignores
+`align_items` entirely**. `positionChildren`, the slow path, computes a
+`cross_off` for `center`, `end` and `baseline`; the fast path does not. So any
+container with cross alignment other than `start` was repositioned wrongly.
+
+`verifyLayout` did not catch this across runs 2-9 because it ran five fixed
+cases. The randomised sweep found it immediately. That is the same lesson run 4
+taught in the other direction — there, verification caught two bugs that
+reported themselves as 2x improvements — and it says the verification was
+necessary but not sufficient.
+
+## What this invalidates
+
+- **The `fast%` column of run 9 is invalid** for the `css_default` and
+  `css_wrap` profiles. Those profiles assign `align_items` randomly, with
+  `center` 40% of the time, so the fast path was being taken on containers
+  where it produced wrong geometry. `mixed/256 css_default`, reported at
+  `fast 100%` and 298 ns, is the clearest case affected.
+- The **`legacy` profile is unaffected.** It never sets `justify` or
+  `align_items`, so both stay at `.start` and the fast path's assumption held.
+  That covers every run before 9.
+
+## What this does NOT invalidate
+
+**The headline claim is untouched.** `unchanged` and `leaf_style` do no layout
+work at all — 15 ns, 245 instructions, zero allocations, identical across all
+three profiles — so a bug inside the repositioning fast path cannot reach them.
+The comparison against GPUI's 2.32 ms of CPU on an unchanged frame stands.
+
+Also unaffected: the finding that `full_refresh` costs only +7% with real
+flexbox, and that an overflowing wide container forces the slow path
+(`fast 0%`), since that path is the correct one.
+
+## The fix, and why it lives in the toolkit and not here
+
+The toolkit now caches `max_cross` per container — the cross-axis mirror of
+`sum_main` — so the fast path can compute the alignment offset without the
+sibling scan it exists to avoid, and excludes `baseline` alignment, which would
+need two further running maxima.
+
+`incremental_flex.zig` is **deliberately left unfixed.** It is the artefact runs
+2 through 9 were produced by, and editing it would make those numbers
+unreproducible. The correction is recorded here instead, which is the same
+reason the run 9 climb bug was left in place in `incremental.zig`.

@@ -164,4 +164,11 @@ Run 9 also found a real bug in the climb logic that is **latent in
 `incremental.zig`**, reachable only once baselines let a change propagate to the
 root. Runs 2-8 are unaffected and left as they are.
 
-See [RESULTS.md](RESULTS.md), runs 2, 3, 6, 7 and 9.
+**Run 9's `fast%` column is since known to be invalid** for the CSS profiles: a
+randomised equivalence test written while porting this code into the toolkit
+found that the reposition fast path ignored `align_items`, so it was taken on
+containers where it produced wrong geometry. The headline claim is untouched,
+because an unchanged frame does no layout at all. See the correction at the end
+of RESULTS.md.
+
+See [RESULTS.md](RESULTS.md), runs 2, 3, 6, 7, 9 and the run 9 correction.
