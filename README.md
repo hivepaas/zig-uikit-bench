@@ -167,8 +167,10 @@ root. Runs 2-8 are unaffected and left as they are.
 **Run 9's `fast%` column is since known to be invalid** for the CSS profiles: a
 randomised equivalence test written while porting this code into the toolkit
 found that the reposition fast path ignored `align_items`, so it was taken on
-containers where it produced wrong geometry. The headline claim is untouched,
-because an unchanged frame does no layout at all. See the correction at the end
-of RESULTS.md.
+containers where it produced wrong geometry. A second defect in the same rule —
+a single flex line taking its cross extent from its largest child rather than
+from the container — was found afterwards by *looking at rendered pixels*, and
+is also present here. The headline claim is untouched, because an unchanged
+frame does no layout at all. See the correction at the end of RESULTS.md.
 
 See [RESULTS.md](RESULTS.md), runs 2, 3, 6, 7, 9 and the run 9 correction.

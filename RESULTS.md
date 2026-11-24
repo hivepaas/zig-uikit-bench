@@ -981,10 +981,26 @@ flexbox, and that an overflowing wide container forces the slow path
 
 ## The fix, and why it lives in the toolkit and not here
 
-The toolkit now caches `max_cross` per container — the cross-axis mirror of
-`sum_main` — so the fast path can compute the alignment offset without the
-sibling scan it exists to avoid, and excludes `baseline` alignment, which would
+The toolkit's first fix cached `max_cross` per container — the cross-axis mirror
+of `sum_main` — so the fast path could compute the alignment offset without the
+sibling scan it exists to avoid, excluding `baseline` alignment, which would
 need two further running maxima.
+
+**That cache was removed again two days later, and the reason is worth keeping.**
+Rendering a demo interface through the toolkit's new scene layer showed an
+invisible 116-pixel popover anchor pushing a 28-pixel toolbar row's contents 51
+pixels down. The cause was the rule the cache served: a single non-wrapping
+line's cross extent was being taken as the largest child, where CSS 9.4 step 8
+says it is the container's own inner cross size. The container's size is already
+to hand, so the correct rule needs no maximum over siblings at all, and
+`max_cross` became dead state. The exclusion of `baseline` from the fast path
+stands, for the unchanged reason.
+
+Two things follow for this repository. The `fast%` column of run 9 is still
+invalid for the CSS profiles, for the reason given above — that conclusion does
+not depend on which fix was right. And `incremental_flex.zig` has the same wrong
+cross-extent rule as well as the original bug, which is one more reason the
+numbers it produced are the numbers it produced, and not a baseline to build on.
 
 `incremental_flex.zig` is **deliberately left unfixed.** It is the artefact runs
 2 through 9 were produced by, and editing it would make those numbers
